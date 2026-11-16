@@ -3,10 +3,13 @@
 // buy (15 s), live (100 s) or over. Attackers win by wiping the Wardens or
 // detonating the device; defenders win by wiping the Vanguard, defusing, or
 // running the clock out with no plant. First to 5 rounds takes the match.
+//
+// Teams: A = Vanguard (attack, the player's team), B = Wardens (defend).
+// The player always attacks; the bomb carrier is the player on odd rounds
+// and a bot on even ones, so both sides of the objective get played.
 import * as THREE from 'three';
-import { WEAPONS, GRENADES, BUY_MENU, fire, startReload, stepReload, decayBloom, currentSpread, stepFeel, buy as buyItem, switchWeapon } from './weapons.js';
-import { createEconomy, roundEnd as payRound } from './economy.js';
-import { HOLD_SPOTS } from './map.js';
+import { WEAPONS, GRENADES, BUY_MENU, fire, currentSpread, stepFeel, buy as buyItem } from './weapons.js';
+import { roundEnd as payRound } from './economy.js';
 import { pick } from './rng.js';
 
 const BUY_SECONDS = 15;
@@ -17,6 +20,9 @@ const ROUND_END_SECONDS = 4.5;
 const WIN_ROUNDS = 5;
 const MAX_ROUNDS = 9;
 
+// Bot buy progression: round 1 is pistols and SMGs, later rounds the bots
+// roll a rifle or a sniper out of the pool. A bot that already owns its
+// weapon keeps it; the loadout only decides what it spawns with.
 const BOT_BUY = [
   { weapon: 'p9', armor: false },
   { weapon: 'hornet', armor: true },
@@ -25,10 +31,16 @@ const BOT_BUY = [
   { weapon: 'longbow', armor: true },
 ];
 
+// Waypoint indices for the three attack entries: A lane, B lane, mid.
+const ATTACK_ENTRIES = { A: [22, 23, 24], B: [26, 27, 28], mid: [16, 15, 17] };
+const DEFEND_SPOTS = [22, 26, 16, 23, 27];
+
 export function createGame(deps) {
   const { scene, camera, map, player, input, weapons, bots, bomb, economy, audio, effects, hud, random } = deps;
   const raycaster = new THREE.Raycaster();
   raycaster.far = 140;
+  // Scratch vectors: the hot loops (shooting, tracers) reuse these instead
+  // of allocating a Vector3 per pellet per frame.
   const shootDir = new THREE.Vector3();
   const muzzle = new THREE.Vector3();
   const hitPoint = new THREE.Vector3();
@@ -40,8 +52,8 @@ export function createGame(deps) {
     scoreA: 0, scoreB: 0, // A = Vanguard (attack), B = Wardens (defend)
     phaseT: 0,
     roundKills: 0, plantedThisRound: false,
-    carrierId: -1,
-    noise: null,
+    carrierId: -1, // -2 = the player carries, -1 = nobody, else a bot id
+    noise: null, // last loud sound {x, z, at}: bots hear it and investigate
     smokes: [],
     flashes: [],
     grenades: [],
@@ -51,52 +63,60 @@ export function createGame(deps) {
     lastBombBeep: -10,
   };
 
-  // Weapon viewmodel: boxes on the camera, reshaped per weapon. Each kind has
-  // its own silhouette — a long scoped tube for the sniper, a fat barrel and
-  // pump for the shotgun, a short body for the SMG — plus a stock and a
+  // ---- weapon viewmodel ----
+  // Boxes on the camera, reshaped per weapon. Each kind has its own
+  // silhouette — a long scoped tube for the sniper, a fat barrel and pump
+  // for the shotgun, a short body for the SMG — plus a stock and a
   // foregrip, so the gun reads as a gun instead of a grey bar.
   const viewmodel = new THREE.Group();
   const vmParts = {};
   const vmSway = { x: 0, y: 0, bob: 0 };
+
+  function vmMat(color, roughness = 0.55) {
+    return new THREE.MeshStandardMaterial({ color: new THREE.Color(color), roughness, metalness: 0.25 });
+  }
+  function vmBox(w, h, d, mat, x, y, z, rotX = 0) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    mesh.position.set(x, y, z);
+    if (rotX) mesh.rotation.x = rotX;
+    return mesh;
+  }
+
   function buildViewmodel() {
     while (viewmodel.children.length) viewmodel.remove(viewmodel.children[0]);
-    const mat = (c, r = 0.55) => new THREE.MeshStandardMaterial({ color: new THREE.Color(c), roughness: r, metalness: 0.25 });
-    const dark = mat('#2e333c'), mid = mat('#4a505c'), accent = mat('#2ec4b6', 0.4);
+    const dark = vmMat('#2e333c');
+    const mid = vmMat('#4a505c');
+    const accent = vmMat('#2ec4b6', 0.4);
     const def = WEAPONS[weapons.current];
-    const len = def.kind === 'sniper' ? 0.95 : def.kind === 'shotgun' ? 0.72 : def.kind === 'smg' ? 0.5 : def.kind === 'rifle' ? 0.78 : 0.34;
-    const body = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.11, len), dark);
-    body.position.set(0.26, -0.24, -0.35 - len / 2 + 0.2);
-    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.16, 0.09), mid);
-    grip.position.set(0.26, -0.32, -0.12); grip.rotation.x = 0.35;
-    const mag = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.2, 0.08), mid);
-    mag.position.set(0.26, -0.33, -0.32); mag.rotation.x = 0.15;
-    const sight = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.035, 0.07), accent);
-    sight.position.set(0.26, -0.165, -0.5);
-    const stock = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.09, 0.22), dark);
-    stock.position.set(0.26, -0.25, -0.06);
-    const fore = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.07, 0.16), mid);
-    fore.position.set(0.26, -0.29, -0.52);
-    viewmodel.add(body, grip, mag, sight, stock, fore);
-    if (def.kind === 'sniper') {
+    const kind = def.kind;
+    const len = kind === 'sniper' ? 0.95 : kind === 'shotgun' ? 0.72 : kind === 'smg' ? 0.5 : kind === 'rifle' ? 0.78 : 0.34;
+    viewmodel.add(
+      vmBox(0.07, 0.11, len, dark, 0.26, -0.24, -0.35 - len / 2 + 0.2), // receiver
+      vmBox(0.06, 0.16, 0.09, mid, 0.26, -0.32, -0.12, 0.35), // grip
+      vmBox(0.05, 0.2, 0.08, mid, 0.26, -0.33, -0.32, 0.15), // magazine
+      vmBox(0.02, 0.035, 0.07, accent, 0.26, -0.165, -0.5), // sight
+      vmBox(0.06, 0.09, 0.22, dark, 0.26, -0.25, -0.06), // stock
+      vmBox(0.06, 0.07, 0.16, mid, 0.26, -0.29, -0.52), // foregrip
+    );
+    if (kind === 'sniper') {
       const scope = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.22, 12), dark);
-      scope.rotation.x = Math.PI / 2; scope.position.set(0.26, -0.15, -0.5);
-      viewmodel.add(scope);
+      scope.rotation.x = Math.PI / 2;
+      scope.position.set(0.26, -0.15, -0.5);
       const lens = new THREE.Mesh(new THREE.CircleGeometry(0.04, 12), new THREE.MeshBasicMaterial({ color: new THREE.Color('#9fd8e8') }));
       lens.position.set(0.26, -0.15, -0.62);
       lens.rotation.y = Math.PI;
-      viewmodel.add(lens);
+      viewmodel.add(scope, lens);
     }
-    if (def.kind === 'shotgun') {
+    if (kind === 'shotgun') {
       const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.5, 10), mid);
-      barrel.rotation.x = Math.PI / 2; barrel.position.set(0.26, -0.2, -0.62);
-      viewmodel.add(barrel);
-      const pump = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.06, 0.18), dark);
-      pump.position.set(0.26, -0.29, -0.55);
-      viewmodel.add(pump);
+      barrel.rotation.x = Math.PI / 2;
+      barrel.position.set(0.26, -0.2, -0.62);
+      viewmodel.add(barrel, vmBox(0.07, 0.06, 0.18, dark, 0.26, -0.29, -0.55)); // pump
     }
-    if (def.kind === 'smg') {
+    if (kind === 'smg') {
       const can = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.2, 10), dark);
-      can.rotation.x = Math.PI / 2; can.position.set(0.26, -0.21, -0.62);
+      can.rotation.x = Math.PI / 2;
+      can.position.set(0.26, -0.21, -0.62);
       viewmodel.add(can);
     }
     vmParts.muzzleLocal = new THREE.Vector3(0.26, -0.2, -0.35 - len + 0.2);
@@ -104,12 +124,12 @@ export function createGame(deps) {
   buildViewmodel();
   camera.add(viewmodel);
 
-  // Per-frame viewmodel motion: walk bob, look sway, recoil kick, ADS centring
-  // and the reload dip. Called from the main loop with the look delta.
+  // Per-frame viewmodel motion: walk bob, look sway, recoil kick, ADS
+  // centring and the reload dip. Called from the main loop with the look delta.
   function updateViewmodel(dt, lookDx, lookDy) {
     const def = WEAPONS[weapons.current];
     const speed = player.groundSpeed();
-    // Bob: two steps per stride, stronger while sprinting.
+    // Bob: two steps per stride, stronger while sprinting, softer crouched.
     vmSway.bob += dt * (4 + speed * 1.6);
     const bobAmp = Math.min(1, speed / 5) * (player.state.crouched ? 0.4 : 1) * 0.011;
     const bobX = Math.sin(vmSway.bob) * bobAmp;
@@ -122,7 +142,8 @@ export function createGame(deps) {
     const kickZ = kick * 0.09;
     const kickY = kick * 0.03;
     // Reload dip: the gun tilts down and drops through the reload.
-    let dipY = 0, dipRot = 0;
+    let dipY = 0;
+    let dipRot = 0;
     if (weapons.reloading > 0 && weapons.reloadTotal > 0) {
       const f = 1 - weapons.reloading / weapons.reloadTotal; // 0..1
       const dip = Math.sin(f * Math.PI);
@@ -148,6 +169,17 @@ export function createGame(deps) {
     return viewmodel.localToWorld(muzzle);
   }
 
+  // Defenders abandon their holds and rotate to a site: used both when
+  // the player plants and when a bot plants, so the response is identical.
+  function rotateDefendersTo(site) {
+    for (const b of bots.alive('defend')) {
+      b.holdNode = -1;
+      b.state = 'route';
+      bots.setPath(b, site === 'A' ? 22 : 26);
+    }
+  }
+
+  // ---- round setup ----
   function botLoadouts(round) {
     const out = [];
     for (let i = 0; i < 5; i += 1) {
@@ -158,17 +190,18 @@ export function createGame(deps) {
   }
 
   function assignAttackers() {
+    // Most rounds push a site; sometimes the team goes mid and splits.
     const site = random() < 0.42 ? 'A' : random() < 0.82 ? 'B' : 'mid';
-    const entries = { A: [22, 23, 24], B: [26, 27, 28], mid: [16, 15, 17] };
+    const entries = ATTACK_ENTRIES[site];
     const attackers = bots.alive('attack');
     attackers.forEach((b, i) => {
-      const entry = entries[site][i % 3];
       b.routeSite = site;
       b.holdNode = -1;
-      bots.setPath(b, entry);
+      bots.setPath(b, entries[i % 3]);
       b.state = 'route';
     });
-    // The carrier is the first attacker; if the player carries, no bot does.
+    // The carrier is the first attacker; if the player carries, no bot does
+    // (startRound takes it back on odd rounds).
     const carrier = attackers[0];
     if (carrier) carrier.carryingBomb = true;
     state.carrierId = carrier ? carrier.id : -1;
@@ -176,9 +209,8 @@ export function createGame(deps) {
 
   function assignDefenders() {
     const defenders = bots.alive('defend');
-    const spots = [22, 26, 16, 23, 27];
     defenders.forEach((b, i) => {
-      b.holdNode = spots[i % spots.length];
+      b.holdNode = DEFEND_SPOTS[i % DEFEND_SPOTS.length];
       bots.setPath(b, b.holdNode);
       b.state = 'route';
       b.routeSite = null;
@@ -191,7 +223,8 @@ export function createGame(deps) {
     state.phaseT = BUY_SECONDS;
     state.roundKills = 0;
     state.plantedThisRound = false;
-    state.plantProgress = 0; state.defuseProgress = 0;
+    state.plantProgress = 0;
+    state.defuseProgress = 0;
     state.grenades.length = 0;
     state.smokes.length = 0;
     state.spectating = null;
@@ -224,6 +257,8 @@ export function createGame(deps) {
     audio.gust();
   }
 
+  // The buy menu with live prices: armor is a flat $650, everything else
+  // takes its price from its own table.
   function buyList() {
     return BUY_MENU.map((item) => {
       const price = item.id === 'armor' ? 650 : (WEAPONS[item.id]?.price ?? GRENADES[item.id]?.price ?? 0);
@@ -231,15 +266,14 @@ export function createGame(deps) {
     });
   }
 
+  // ---- round end ----
   function endRound(winner, reason) {
     if (state.phase !== 'live') return;
     state.phase = 'roundEnd';
     state.phaseT = ROUND_END_SECONDS;
     state.roundWinner = winner;
     if (winner === 'attack') state.scoreA += 1; else state.scoreB += 1;
-    const before = economy.money;
-    payRound(economy, winner === 'attack', state.roundKills, state.plantedThisRound);
-    const earned = economy.money - before;
+    const earned = payRound(economy, winner === 'attack', state.roundKills, state.plantedThisRound);
     hud.setScore(state.scoreA, state.scoreB);
     hud.setMoney(economy.money);
     hud.hideBuy();
@@ -263,8 +297,10 @@ export function createGame(deps) {
     if (bomb.state.status === 'defused') { endRound('defend', 'The device was defused.'); return; }
     if (atk === 0) { endRound('defend', 'Vanguard eliminated.'); return; }
     if (def === 0) {
-      if (bomb.state.status === 'planted' || bomb.state.status === 'defusing') return; // bomb still decides it
-      endRound('attack', 'Wardens eliminated.'); return;
+      // A planted bomb still decides the round: the defenders are dead,
+      // but the device can still go off — or be defused by no one.
+      if (bomb.state.status === 'planted' || bomb.state.status === 'defusing') return;
+      endRound('attack', 'Wardens eliminated.');
     }
   }
 
@@ -285,12 +321,15 @@ export function createGame(deps) {
     checkRoundEnd(0);
   }
 
+  // Damage to the player, through armor first: armor absorbs half the hit
+  // (rounded) until it runs out, so 100 armor eats about 200 damage.
   function damagePlayer(amount, fromPos, killerName) {
     if (!playerAlive()) return;
     let dmg = amount;
     if (weapons.armor > 0) {
       const absorbed = Math.min(weapons.armor, Math.round(dmg * 0.5));
-      weapons.armor -= absorbed; dmg -= absorbed;
+      weapons.armor -= absorbed;
+      dmg -= absorbed;
     }
     player.state.hp -= dmg;
     audio.hurt();
@@ -314,13 +353,15 @@ export function createGame(deps) {
     if (!playerAlive()) return;
     const shot = fire(weapons, now);
     if (!shot) {
+      // Click on an empty magazine: the dry-fire click, not silence.
       if (weapons.ammo[weapons.current].mag === 0 && weapons.reloading <= 0) audio.dryFire();
       return;
     }
     const def = shot.weapon;
     const spread = currentSpread(weapons, player.groundSpeed(), !player.state.onGround, input.state.aiming, player.state.crouched);
     camera.getWorldDirection(shootDir);
-    // Recoil: pitch up, slight yaw drift.
+    // Recoil: pitch up, slight yaw drift, a little random each shot so a
+    // spray walks instead of stacking on one pixel.
     player.recoil(def.recoil * (0.8 + Math.random() * 0.4), (Math.random() * 2 - 1) * def.recoil * 0.4);
     audio.shot(def.kind);
     const from = muzzleWorld();
@@ -328,6 +369,8 @@ export function createGame(deps) {
     state.noise = { x: player.state.position.x, z: player.state.position.z, at: now };
     let hitSomething = false;
     for (let p = 0; p < shot.pellets; p += 1) {
+      // Each pellet gets its own jitter inside the spread cone. The spread
+      // is added per axis and renormalised, so the cone stays a cone.
       const dir = shootDir.clone();
       dir.x += (Math.random() * 2 - 1) * spread;
       dir.y += (Math.random() * 2 - 1) * spread;
@@ -354,6 +397,8 @@ export function createGame(deps) {
         if (bot && bot.alive) {
           const part = hit.object.userData.part ?? 'torso';
           const dist = hit.distance;
+          // Damage falls off past 30 m: a rifle still hurts at range, a
+          // pistol does not.
           const falloff = dist > 30 ? 0.8 : 1;
           const dmg = Math.round(def.damage * (part === 'head' ? def.headMult : part === 'legs' ? 0.75 : 1) * falloff);
           const killed = bots.damage(bot, dmg, part);
@@ -406,14 +451,19 @@ export function createGame(deps) {
       const g = state.grenades[i];
       g.vel.y -= 14 * dt;
       g.pos.addScaledVector(g.vel, dt);
-      // Bounce off AABBs (cheap: clamp + reflect the dominant axis).
+      // Bounce off AABBs (cheap: clamp + reflect the dominant axis). A
+      // grenade that has bounced four times is spent — it goes off where
+      // it is instead of rolling forever.
       for (const b of map.colliders) {
-        if (g.pos.x > b.min.x - 0.12 && g.pos.x < b.max.x + 0.12 &&
-            g.pos.y > b.min.y - 0.12 && g.pos.y < b.max.y + 0.12 &&
-            g.pos.z > b.min.z - 0.12 && g.pos.z < b.max.z + 0.12) {
-          const dxMin = Math.abs(g.pos.x - b.min.x), dxMax = Math.abs(g.pos.x - b.max.x);
-          const dzMin = Math.abs(g.pos.z - b.min.z), dzMax = Math.abs(g.pos.z - b.max.z);
-          const dyMin = Math.abs(g.pos.y - b.min.y), dyMax = Math.abs(g.pos.y - b.max.y);
+        if (g.pos.x > b.min.x - 0.12 && g.pos.x < b.max.x + 0.12
+          && g.pos.y > b.min.y - 0.12 && g.pos.y < b.max.y + 0.12
+          && g.pos.z > b.min.z - 0.12 && g.pos.z < b.max.z + 0.12) {
+          const dxMin = Math.abs(g.pos.x - b.min.x);
+          const dxMax = Math.abs(g.pos.x - b.max.x);
+          const dzMin = Math.abs(g.pos.z - b.min.z);
+          const dzMax = Math.abs(g.pos.z - b.max.z);
+          const dyMin = Math.abs(g.pos.y - b.min.y);
+          const dyMax = Math.abs(g.pos.y - b.max.y);
           const m = Math.min(dxMin, dxMax, dzMin, dzMax, dyMin, dyMax);
           if (m === dxMin || m === dxMax) g.vel.x *= -0.45;
           else if (m === dzMin || m === dzMax) g.vel.z *= -0.45;
@@ -423,7 +473,12 @@ export function createGame(deps) {
           break;
         }
       }
-      if (g.pos.y < 0.12) { g.pos.y = 0.12; g.vel.y = Math.abs(g.vel.y) * 0.4; g.vel.x *= 0.7; g.vel.z *= 0.7; }
+      if (g.pos.y < 0.12) {
+        g.pos.y = 0.12;
+        g.vel.y = Math.abs(g.vel.y) * 0.4;
+        g.vel.x *= 0.7;
+        g.vel.z *= 0.7;
+      }
       g.fuse -= dt;
       if (g.fuse <= 0 || g.bounced > 4) {
         state.grenades.splice(i, 1);
@@ -437,6 +492,9 @@ export function createGame(deps) {
     if (g.id === 'frag') {
       effects.explosion(g.pos);
       audio.explosion();
+      // Damage falls off linearly to the edge, and a wall does not help:
+      // the radius is the radius. Friendly fire is off for bots, on for
+      // the player — a frag at your own feet hurts.
       const hurt = (target, isPlayer) => {
         const d = Math.hypot(target.pos.x - g.pos.x, target.pos.z - g.pos.z);
         if (d > def.radius) return;
@@ -457,12 +515,15 @@ export function createGame(deps) {
       if (s) state.smokes.push({ x: g.pos.x, z: g.pos.z, r: def.radius, until: now + def.duration });
     } else if (g.id === 'flash') {
       effects.explosion(g.pos);
-      // Anyone looking at the flash within radius and line of sight is blinded.
+      // Anyone looking at the flash within radius and line of sight is
+      // blinded; looking away, or far off, only dims it. Bots get a
+      // blind timer; the player gets a white flash on the screen.
       const blind = (target, isPlayer) => {
         const d = Math.hypot(target.pos.x - g.pos.x, target.pos.z - g.pos.z);
         if (d > def.radius) return;
         if (isPlayer) {
-          const dx = g.pos.x - player.state.position.x, dz = g.pos.z - player.state.position.z;
+          const dx = g.pos.x - player.state.position.x;
+          const dz = g.pos.z - player.state.position.z;
           const ang = Math.atan2(-dx, -dz);
           const diff = Math.abs(((ang - player.state.yaw + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
           if (diff < 1.6) hud.flashBlind(Math.max(0.25, 1 - d / def.radius));
@@ -490,7 +551,8 @@ export function createGame(deps) {
       if (bs.status === 'detonated') { checkRoundEnd(now); return; }
       if (bs.status === 'defused') { checkRoundEnd(now); return; }
     }
-    // Player planting.
+    // Player planting: hold E inside a site for the full plant time. Letting
+    // go — or stepping out — bleeds the progress back down twice as fast.
     if (playerAlive() && state.carrierId === -2) {
       const site = bomb.inSite(player.state.position.x, player.state.position.z);
       const holding = input.state.keys.has('KeyE');
@@ -507,11 +569,8 @@ export function createGame(deps) {
           audio.plant();
           hud.banner('DEVICE PLANTED', `at site ${site} — defend it until it blows`, 3200);
           hud.killfeed('You planted the device', true);
-          // Defenders rotate.
-          for (const b of bots.alive('defend')) {
-            b.holdNode = -1; b.state = 'route';
-            bots.setPath(b, site === 'A' ? 22 : 26);
-          }
+          // Defenders rotate to the planted site.
+          rotateDefendersTo(site);
         }
       } else {
         state.plantProgress = Math.max(0, state.plantProgress - dt * 2);
@@ -521,8 +580,8 @@ export function createGame(deps) {
         }
       }
     }
-    // Player defusing (player is attacker, so this never happens for the player;
-    // kept for symmetry if the player ever defends).
+    // Player defusing (the player attacks, so this never fires in a normal
+    // match; kept for symmetry if the player ever defends).
     if (playerAlive() && (bs.status === 'planted' || bs.status === 'defusing')) {
       const d = Math.hypot(bomb.state.pos.x - player.state.position.x, bomb.state.pos.z - player.state.position.z);
       if (d < 1.6 && input.state.keys.has('KeyE')) {
@@ -541,13 +600,15 @@ export function createGame(deps) {
     }
   }
 
-  // Bot events, wired by main.js into the bots module.
+  // Bot events, wired by main.js into the bots module. The bots call these;
+  // the game answers with rules, sound and HUD.
   const botEvents = {
     onBotFootstep(bot) {
       // Only audible when the bot is near the player.
       const d = Math.hypot(bot.pos.x - player.state.position.x, bot.pos.z - player.state.position.z);
       if (d < 16) audio.distantStep(d);
     },
+
     onBotShot(bot, target, dmg, headshot, muzzlePos) {
       // Tracer + sound for every bot shot.
       const from = new THREE.Vector3(muzzlePos.x, muzzlePos.y, muzzlePos.z);
@@ -561,8 +622,7 @@ export function createGame(deps) {
         } else {
           const killed = bots.damage(target, dmg, headshot ? 'head' : 'torso');
           if (killed) {
-            const killerTeam = bot.team;
-            hud.killfeed(`${bot.name}  [${WEAPONS[bot.weapon].name}]  ${target.name}`, killerTeam === 'attack');
+            hud.killfeed(`${bot.name}  [${WEAPONS[bot.weapon].name}]  ${target.name}`, bot.team === 'attack');
             if (target.carryingBomb) {
               bomb.drop(target.pos.x, target.pos.z);
               target.carryingBomb = false;
@@ -571,17 +631,23 @@ export function createGame(deps) {
         }
       }
     },
+
     onDeath(bot) {
-      // Drop the bomb, reassign the carrier.
+      // Drop the bomb, reassign the carrier to the next living attacker.
       if (bot.carryingBomb) {
         bomb.drop(bot.pos.x, bot.pos.z);
         bot.carryingBomb = false;
         const next = bots.alive('attack')[0];
-        if (next) { next.carryingBomb = true; state.carrierId = next.id; }
-        else state.carrierId = -1;
+        if (next) {
+          next.carryingBomb = true;
+          state.carrierId = next.id;
+        } else {
+          state.carrierId = -1;
+        }
       }
       checkRoundEnd(0);
     },
+
     onBotArrived(bot) {
       if (bot.team === 'attack' && bot.routeSite) {
         const site = bot.routeSite === 'mid' ? null : bot.routeSite;
@@ -590,11 +656,14 @@ export function createGame(deps) {
           const inSite = bot.pos.x >= s.minX && bot.pos.x <= s.maxX && bot.pos.z >= s.minZ && bot.pos.z <= s.maxZ;
           const enemiesNear = bots.alive('defend').some((d) => Math.hypot(d.pos.x - bot.pos.x, d.pos.z - bot.pos.z) < 14);
           if (inSite && !enemiesNear) {
-            bot.state = 'plant'; bot.plantProgress = 0;
+            // Clear site, bomb in hand: plant it.
+            bot.state = 'plant';
+            bot.plantProgress = 0;
             bomb.startPlant(site, bot);
           } else if (inSite) {
             // Hold the site and wait for it to clear.
-            bot.state = 'hold'; bot.holdNode = bot.routeSite === 'A' ? 22 : 26;
+            bot.state = 'hold';
+            bot.holdNode = bot.routeSite === 'A' ? 22 : 26;
           } else {
             // Walk to the site center, then the arrival handler plants.
             const c = map.sites[site].center;
@@ -614,9 +683,11 @@ export function createGame(deps) {
         if (bot.holdNode >= 0) bot.state = 'hold';
       }
     },
+
     onPlantStart(bot) {
       bomb.startPlant(bot.routeSite, bot);
     },
+
     onPlantDone(bot) {
       bomb.finishPlant(bot.pos.x, bot.pos.z, bot.routeSite ?? bomb.state.site);
       state.plantedThisRound = true;
@@ -624,17 +695,16 @@ export function createGame(deps) {
       bot.state = 'hold';
       audio.plant();
       hud.banner('DEVICE PLANTED', `at site ${bomb.state.site} — the Wardens are rotating`, 3200);
-      for (const b of bots.alive('defend')) {
-        b.holdNode = -1; b.state = 'route';
-        bots.setPath(b, bomb.state.site === 'A' ? 22 : 26);
-      }
+      rotateDefendersTo(bomb.state.site);
     },
+
     onDefuseDone(bot) {
       bomb.finishDefuse();
       checkRoundEnd(0);
     },
   };
 
+  // ---- the step ----
   function step(dt, now) {
     // Prune expired smokes.
     state.smokes = state.smokes.filter((s) => now < s.until);
@@ -671,7 +741,7 @@ export function createGame(deps) {
     if (state.phase !== 'live') return;
     // Weapon feel state: recoil kick, draw timer, ADS blend.
     stepFeel(weapons, dt, input.state.aiming);
-    // Round timer: stops once the bomb is planted.
+    // Round timer: stops once the bomb is planted — the fuse is the timer then.
     if (bomb.state.status !== 'planted' && bomb.state.status !== 'defusing') {
       state.phaseT -= dt;
       hud.setTimer(state.phaseT, 'live');
@@ -684,7 +754,8 @@ export function createGame(deps) {
     }
     stepBomb(dt, now);
     stepGrenades(dt, now);
-    // Bot context: player, both teams, smokes, noise, time.
+    // Bot context: player, both teams, smokes, noise, time. The bots read
+    // this and nothing else — the game is their whole world.
     const ctx = {
       now,
       playerAlive: playerAlive(),
@@ -703,13 +774,15 @@ export function createGame(deps) {
       bombSite: bomb.state.site,
     };
     bots.step(ctx, dt);
+    // Noise is a one-step event: heard this step, gone the next.
     state.noise = null;
     // Bomb carrier pickup: an attacker walking over a dropped bomb takes it.
     if (bomb.state.status === 'dropped') {
       for (const b of bots.alive('attack')) {
         const d = Math.hypot(b.pos.x - bomb.state.pos.x, b.pos.z - bomb.state.pos.z);
         if (d < 1.2) {
-          b.carryingBomb = true; state.carrierId = b.id;
+          b.carryingBomb = true;
+          state.carrierId = b.id;
           bomb.pickup();
           break;
         }
@@ -723,14 +796,17 @@ export function createGame(deps) {
         }
       }
     }
-    // A defender that reaches a planted, clear bomb defuses it.
+    // A defender that reaches a planted, clear bomb defuses it. "Clear"
+    // means no living attacker nearby and the player dead or far away —
+    // a defuse under fire does not happen.
     if (bomb.state.status === 'planted') {
       for (const b of bots.alive('defend')) {
         const d = Math.hypot(b.pos.x - bomb.state.pos.x, b.pos.z - bomb.state.pos.z);
         if (d < 1.8) {
           const enemiesNear = bots.alive('attack').some((a) => Math.hypot(a.pos.x - b.pos.x, a.pos.z - b.pos.z) < 12) || playerAlive();
           if (!enemiesNear) {
-            b.state = 'defuse'; b.defuseProgress = 0;
+            b.state = 'defuse';
+            b.defuseProgress = 0;
             bomb.startDefuse();
             hud.banner('DEFUSE IN PROGRESS', 'Stop the Warden at the device', 2600);
             break;
@@ -742,10 +818,14 @@ export function createGame(deps) {
   }
 
   return {
-    state, botEvents,
+    state,
+    botEvents,
     startMatch() {
-      state.scoreA = 0; state.scoreB = 0; state.round = 0;
-      economy.money = 800; economy.lossStreak = 0;
+      state.scoreA = 0;
+      state.scoreB = 0;
+      state.round = 0;
+      economy.money = 800;
+      economy.lossStreak = 0;
       weapons.current = 'p9';
       weapons.owned = new Set(['p9']);
       weapons.ammo.p9 = { mag: 12, reserve: 36 };
@@ -754,7 +834,11 @@ export function createGame(deps) {
       player.state.hp = 100;
       startRound();
     },
-    step, playerShoot, throwGrenade, buildViewmodel, updateViewmodel,
+    step,
+    playerShoot,
+    throwGrenade,
+    buildViewmodel,
+    updateViewmodel,
     tryBuy(id) {
       const cost = buyItem(weapons, id, economy.money);
       if (cost === null) return false;
